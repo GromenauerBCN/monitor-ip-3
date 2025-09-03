@@ -1,86 +1,75 @@
 import net from 'net';
 
-// ❗ Força IPv4 a undici (fetch de Node 18/20+)
-import { Agent, setGlobalDispatcher } from 'undici';
-setGlobalDispatcher(new Agent({ connect: { family: 4 } }));
-
 const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 
-export async function checkHttp(url: string, timeoutMs = 12000): Promise<{ ok: boolean; latencyMs?: number; error?: string }> {
-  const start = Date.now();
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+function isHttpAddress(address?: string) {
+  const a = (address || '').trim().toLowerCase();
+  return a.startsWith('http://') || a.startsWith('https://');
+}
 
+function buildUrl(kind: string | undefined, address: string): string {
+  const a = address.trim();
+  if (isHttpAddress(a)) return a; // ja ve amb protocol
+  // si no porta protocol, assumim http (el camp kind al model és "http" | "tcp")
+  return `http://${a}`;
+}
+
+export async function checkHttp(url: string, timeoutMs = 8000): Promise<boolean> {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const baseInit: RequestInit = {
+    const r = await fetch(url, {
       signal: ctrl.signal,
       redirect: 'follow',
       headers: {
-        'user-agent': 'MonitorIP/1.0 (+https://monitor-ip-3.onrender.com)',
-        'accept': '*/*',
-        'accept-encoding': 'gzip, deflate, br',
-        'connection': 'keep-alive',
-      },
-    };
-
-    // Intent lleuger amb HEAD
-    let r = await fetch(url, { ...baseInit, method: 'HEAD' }).catch(() => null as any);
-    if (!r || !r.ok) {
-      // Fallback a GET
-      r = await fetch(url, { ...baseInit, method: 'GET' }).catch(() => null as any);
-    }
-
-    const latency = Date.now() - start;
-    if (!r) return { ok: false, latencyMs: latency, error: 'network/TLS error' };
-
-    // Acceptem 2xx i 3xx com a UP
-    const up = r.status < 400;
-    if (!up) return { ok: false, latencyMs: latency, error: `HTTP ${r.status}` };
-
-    return { ok: true, latencyMs: latency };
-  } catch (e: any) {
-    const latency = Date.now() - start;
-    return { ok: false, latencyMs: latency, error: e?.message || 'exception' };
+        // alguns serveis rebutgen peticions sense UA
+        'user-agent': 'MonitorIP/1.0 (+https://example.invalid)'
+      }
+    });
+    return r.ok;
+  } catch {
+    return false;
   } finally {
-    clearTimeout(t);
+    clearTimeout(id);
   }
 }
 
-export async function checkTcp(host: string, port: number, timeoutMs = 8000): Promise<{ ok: boolean; latencyMs?: number; error?: string }> {
+export async function checkTcp(host: string, port: number, timeoutMs = 5000): Promise<boolean> {
   return new Promise((resolve) => {
-    const start = Date.now();
     const socket = new net.Socket();
-    let finished = false;
-
-    const finish = (ok: boolean, error?: string) => {
-      if (finished) return;
-      finished = true;
-      const latency = Date.now() - start;
-      socket.destroy();
-      resolve({ ok, latencyMs: latency, error });
-    };
-
+    let done = false;
+    const finish = (ok: boolean) => { if (!done) { done = true; try { socket.destroy(); } catch {} resolve(ok); } };
     socket.setTimeout(timeoutMs);
     socket.once('connect', () => finish(true));
-    socket.once('timeout', () => finish(false, 'timeout'));
-    socket.once('error', (err) => finish(false, err?.message || 'error'));
+    socket.once('error', () => finish(false));
+    socket.once('timeout', () => finish(false));
     socket.connect(port, host);
   });
 }
 
-/** Retrys: 3 intents separats X segons */
-export async function checkWithRetries(kind: 'http'|'tcp', host: string, port?: number): Promise<{ ok: boolean; latencyMs?: number; error?: string }> {
+/**
+ * Manté la signatura existent 'http'|'tcp', però detecta també URLs amb https://
+ * - Si 'host' comença per http(s) → es fa HTTP(S) encara que kind sigui 'http'
+ * - Si no és una URL i kind és 'http' → es construeix http://<host>
+ * - En qualsevol altre cas → TCP (requereix port)
+ */
+export async function checkWithRetries(kind: 'http' | 'tcp', host: string, port?: number): Promise<boolean> {
   const attempts = Number(process.env.RETRY_ATTEMPTS || 3);
   const intervalMs = Number(process.env.RETRY_INTERVAL_SEC || 60) * 1000;
 
-  let last: { ok: boolean; latencyMs?: number; error?: string } = { ok: false };
   for (let i = 1; i <= attempts; i++) {
-    last = kind === 'http'
-      ? await checkHttp(host)
-      : await checkTcp(host, port!);
+    let ok = false;
 
-    if (last.ok) return last;
-    if (i < attempts) await sleep(intervalMs);
+    if (isHttpAddress(host) || kind === 'http') {
+      const url = buildUrl(kind, host);
+      ok = await checkHttp(url);
+    } else {
+      if (!port) return false; // TCP sense port no té sentit
+      ok = await checkTcp(host, port);
+    }
+
+    if (ok) return true;                    // surt si algun intent va bé
+    if (i < attempts) await sleep(intervalMs);  // espera abans del proper intent
   }
-  return last;
+  return false; // tots els intents KO
 }

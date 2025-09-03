@@ -1,6 +1,6 @@
 import { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import { prisma } from './db.js';
-import { checkHttp, checkTcp } from './checks.js';
+import { checkWithRetries } from './checks.js';
 import { parse } from 'csv-parse/sync';
 
 export const monitorRouter: FastifyPluginAsync = async (app) => {
@@ -26,7 +26,7 @@ export const monitorRouter: FastifyPluginAsync = async (app) => {
     if (!label || !kind || !address) {
       return reply.code(400).send({ error: 'Missing fields' });
     }
-    const k: 'http' | 'tcp' = String(kind).toLowerCase() === 'tcp' ? 'tcp' : 'http';
+    const k = String(kind).toLowerCase() === 'tcp' ? 'tcp' : 'http';
     if (k === 'tcp' && !port) {
       return reply.code(400).send({ error: 'TCP requires port' });
     }
@@ -57,7 +57,7 @@ export const monitorRouter: FastifyPluginAsync = async (app) => {
 
     for (const r of rows) {
       if (!r.label || !r.kind || !r.address) continue;
-      const k: 'http' | 'tcp' = String(r.kind).toLowerCase() === 'tcp' ? 'tcp' : 'http';
+      const k = String(r.kind).toLowerCase() === 'tcp' ? 'tcp' : 'http';
       created.push(
         await prisma.monitorTarget.create({
           data: {
@@ -89,7 +89,7 @@ export const monitorRouter: FastifyPluginAsync = async (app) => {
     return { ok: true };
   });
 
-  // Check manual (un únic intent; els retries els fa el scheduler)
+  // Check manual (no envia alertes; només comprova i persisteix)
   app.post('/api/targets/:id/check', async (req, reply) => {
     // @ts-ignore
     const userId = (req as any).user.id as string;
@@ -108,7 +108,7 @@ export const monitorRouter: FastifyPluginAsync = async (app) => {
     const userId = (req as any).user.id as string;
     const targets = await prisma.monitorTarget.findMany({ where: { userId } });
 
-    const latest: Array<{ targetId: string; ok: boolean | null; latencyMs?: number | null; error?: string | null; checkedAt?: Date | null }> = [];
+    const latest = [];
     for (const t of targets) {
       const c = await prisma.checkResult.findFirst({
         where: { targetId: t.id },
@@ -117,9 +117,9 @@ export const monitorRouter: FastifyPluginAsync = async (app) => {
       latest.push({
         targetId: t.id,
         ok: c?.ok ?? null,
-        latencyMs: c?.latencyMs ?? null,
-        error: c?.error ?? null,
-        checkedAt: c?.checkedAt ?? null
+        latencyMs: c?.latencyMs,
+        error: c?.error,
+        checkedAt: c?.checkedAt
       });
     }
     return latest;
@@ -127,41 +127,46 @@ export const monitorRouter: FastifyPluginAsync = async (app) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// Execució d’un check i persistència del resultat (sense retries)
+// Execució d’un check i persistència del resultat
 // ─────────────────────────────────────────────────────────────
 export async function runCheckAndPersist(targetId: string) {
   const t = await prisma.monitorTarget.findUnique({ where: { id: targetId } });
   if (!t || !t.enabled) return null;
 
-  // Un sol check: el scheduler ja fa els retries/intervals
-  let res: { ok: boolean; latencyMs?: number; error?: string };
-  if (t.kind === 'http') {
-    // Si l'adreça no porta protocol, per seguretat fem http://
-    const url = /^https?:\/\//i.test(t.address) ? t.address : `http://${t.address}`;
-    res = await checkHttp(url);
-  } else {
-    res = await checkTcp(t.address, t.port || 80);
+  const started = Date.now();
+
+  let ok = false;
+  let error: string | undefined;
+
+  try {
+    // IMPORTANT: checkWithRetries detecta HTTP/HTTPS si l’address ja porta protocol
+    ok = await checkWithRetries(t.kind as 'http' | 'tcp', t.address, t.port ?? undefined);
+  } catch (e: any) {
+    ok = false;
+    error = e?.message || 'unknown check error';
   }
 
-  const saved = await prisma.checkResult.create({
-    data: {
-      targetId: t.id,
-      ok: !!res.ok,
-      latencyMs: res.latencyMs ?? null,
-      error: res.error ?? null
-    }
-  });
+  const latencyMs = Date.now() - started;
 
-  const updated = await prisma.monitorTarget.update({
-    where: { id: t.id },
-    data: {
-      lastCheckedAt: saved.checkedAt,
-      lastStatus: res.ok ? 'UP' : 'DOWN',
-      updatedAt: new Date()
-    },
-    select: { id: true, label: true, lastCheckedAt: true, lastStatus: true }
-  });
+const saved = await prisma.checkResult.create({
+  data: {
+    targetId: t.id,
+    ok,
+    latencyMs: ok ? latencyMs : null,
+    error: ok ? null : (error || `${t.kind} ${t.address}${t.port ? ':' + t.port : ''} failed`)
+  }
+});
 
-  // Retorn coherent amb el frontend que refresca estat immediat
-  return { ok: res.ok, target: updated, lastResult: saved };
+const updated = await prisma.monitorTarget.update({
+  where: { id: t.id },
+  data: {
+    lastCheckedAt: saved.checkedAt,
+    lastStatus: ok ? 'UP' : 'DOWN',
+    updatedAt: new Date()
+  },
+  select: { id: true, label: true, lastCheckedAt: true, lastStatus: true }
+});
+
+return { ok: true, target: updated, lastResult: saved };
+
 }
