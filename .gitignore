@@ -4,3 +4,15 @@
 backend/.env
 web/.env
 *.env
+
+.env
+.env.*
+backend/.env
+web/.env
+*.env
+
+.env
+.env.*
+backend/.env
+web/.env
+*.env
