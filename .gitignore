@@ -1,0 +1,6 @@
+
+.env
+.env.*
+backend/.env
+web/.env
+*.env
