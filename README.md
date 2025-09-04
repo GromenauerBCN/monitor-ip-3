@@ -1,4 +1,4 @@
-# MonitorIP — Web + Backend + Apps (Android/iOS)
+# MonitorIP — Web + Backend + Apps (Android/iOS) [Beta]
 
 Aplicació completa de monitoratge d'IPs/URLs amb:
 - **Comprovacions automàtiques cada 20 min** (i a petició) via HTTP o TCP.
